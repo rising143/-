@@ -54,7 +54,6 @@ SIM_THRESHOLD = 0.70   # ★ 实时系统阈值调低
 ########################
 # 注册配置
 ########################
-REGISTER_SPEAKERS = ["张三","whs"]
 REGISTER_NUM_PER_SPK = 5
 
 ########################
@@ -126,49 +125,79 @@ def start_audio_stream():
 ########################
 def register_loop():
     print("\n📝 进入声纹注册模式")
+    print("👉 输入说话人名字开始注册")
+    print("👉 直接回车 / 输入 q / quit / exit 结束注册并进入识别\n")
 
-    buffer = np.zeros(0, dtype=np.int16)
+    while True:
+        name = input("👤 请输入说话人名字：").strip()
 
-    for name in REGISTER_SPEAKERS:
-        print(f"\n👉 请注册说话人：{name}")
+        if name == "" or name.lower() in ["q", "quit", "exit"]:
+            break
+
+        if name in speaker_db:
+            print("⚠️ 该说话人已存在，请换一个名字")
+            continue
+
+        print(f"\n🎙 请说话人「{name}」开始说话")
+
+        # ★ 清空残留音频
+        while not audio_queue.empty():
+            audio_queue.get()
+
+        buffer = np.zeros(0, dtype=np.int16)
         embs = []
+
+        current_speech_audio = []
+        silence_frames = 0
+        SILENCE_END_FRAMES = 5  # ≈ 50ms * 5
 
         while len(embs) < REGISTER_NUM_PER_SPK:
             chunk = audio_queue.get()
             buffer = np.concatenate([buffer, chunk])
 
-            if len(buffer) < SAMPLE_RATE:
+            # ★ 至少 0.5 秒音频再做 VAD
+            if len(buffer) < int(SAMPLE_RATE * 0.5):
                 continue
 
             wav_float = buffer.astype(np.float32) / 32768.0
+            buffer = buffer[-int(SAMPLE_RATE * 0.25):]
 
             speech_ts = get_speech_timestamps(
                 wav_float, vad_model, sampling_rate=SAMPLE_RATE
             )
 
-            if not speech_ts:
-                buffer = buffer[-int(SAMPLE_RATE * 0.5):]
-                continue
+            if speech_ts:
+                silence_frames = 0
+                current_speech_audio.append(wav_float.copy())
+            else:
+                if current_speech_audio:
+                    silence_frames += 1
 
-            start = speech_ts[0]['start']
-            end = speech_ts[-1]['end']
-            speech_audio = wav_float[start:end]
-            buffer = np.zeros(0, dtype=np.int16)
+                    if silence_frames >= SILENCE_END_FRAMES:
+                        full_audio = np.concatenate(current_speech_audio)
+                        current_speech_audio.clear()
+                        silence_frames = 0
 
-            emb = extract_embedding(speech_audio)
-            if emb is None:
-                print("⚠️ 语音太短，重说")
-                continue
+                        duration = len(full_audio) / SAMPLE_RATE
+                        if duration < 1.0:
+                            print(f"⚠️ 语音太短 ({duration:.2f}s)，请完整说一句")
+                            continue
 
-            embs.append(emb)
-            print(f"✅ 已采集 {len(embs)}/{REGISTER_NUM_PER_SPK}")
+                        emb = extract_embedding(full_audio)
+                        if emb is None:
+                            print("⚠️ embedding 提取失败，重说")
+                            continue
 
-        # ★ 注册完成：求均值 embedding（核心稳定点）
+                        embs.append(emb)
+                        print(f"✅ 已采集 {len(embs)}/{REGISTER_NUM_PER_SPK}")
+
         mean_emb = np.mean(np.stack(embs), axis=0)
         speaker_db[name] = mean_emb
-        print(f"🎉 {name} 注册完成")
+        print(f"🎉 说话人「{name}」注册完成\n")
 
-    print("\n✅ 所有说话人注册完成\n")
+    print(f"\n✅ 注册结束，共注册 {len(speaker_db)} 人：{list(speaker_db.keys())}")
+    print("➡️ 进入实时识别模式\n")
+
 def score_with_active(emb, active_name):
     if active_name is None:
         return 0.0
@@ -193,7 +222,6 @@ def main():
     ACTIVE_SPK_HOLD = 3
     STRONG_SWITCH_THRESHOLD = 0.7  # ★ 强切换阈值
 
-    print("🎤 启动实时多人声纹识别...")
     stream, pa = start_audio_stream()
 
     # ★ 先注册
@@ -212,7 +240,8 @@ def main():
             buffer = np.concatenate([buffer, chunk])
 
             # 至少 1 秒再处理
-            if len(buffer) < SAMPLE_RATE:
+            # ★ 注册阶段：至少积累 0.5 秒再做 VAD
+            if len(buffer) < int(SAMPLE_RATE * 0.5):
                 continue
 
             # ★ 这一行必须有（你刚才缺的）
